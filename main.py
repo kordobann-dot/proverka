@@ -1,907 +1,500 @@
-import asyncio
-import sqlite3
-import random
-import logging
-import sys
+import telebot
+from telebot import types
+import json
 import os
-from datetime import datetime
+import time
+import logging
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.types import (
-    InlineKeyboardButton, 
-    ReplyKeyboardRemove, 
-    BotCommand, 
-    CallbackQuery, 
-    Message,
-    ContentType,
-    BotCommandScopeDefault
-)
+# =================================================================
+# КОНФИГУРАЦИЯ
+# =================================================================
 
-# ==============================================================================
-# БЛОК КОНФИГУРАЦИИ И НАСТРОЕК
-# ==============================================================================
-TOKEN = "8633419537:AAF6r1H1YtfI2whTHVdKzF2JVQnxgu9XfU4"
-CHANNEL_ID = "@pistonCUPsls"
-# Основные администраторы с полным доступом
-SUPER_ADMINS = [5845609895, 6740071266]
-BOT_USERNAME = "@TernatLeague_Bot"
+TOKEN = os.getenv('TOKEN') 
+CHANNEL_ID = '-1003740141875' 
 
-# Настройка подробного логирования для мониторинга в Railway
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
+# ГЛАВНЫЙ АДМИНИСТРАТОР (Твой юзернейм без @)
+SUPER_ADMIN = "Nazikrrk" 
 
-# Инициализация объектов бота и диспетчера
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+# Список владельцев клубов по умолчанию (для проверки прав на трансферы)
+CLUB_OWNERS_LIST = {
+    "banditdontrealme": "Inter Milan 🇮🇹",
+    "ez_mbappe": "Real Madrid 🇪🇸",
+    "estavaojr": "Bayern Munich 🇩🇪",
+    "amojvucu": "Napoli 🇮🇹",
+    "nikitos_201064": "Sporting 🇵🇹",
+    "ilikembb": "Arsenal 🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "pheluix23": "Empoli 🇮🇹",
+    "eoupapa": "Albacete 🇪🇸",
+    "nurikbro20145": "Zenit 🇷🇺",
+    "mbappe_677": "Fiorentina 🇮🇹",
+    "o17_misty": "Ac Milan 🇮🇹",
+    "suleyman1453638": "Juventus 🇮🇹"
+}
 
-# ==============================================================================
-# ГЛОБАЛЬНЫЕ СОСТОЯНИЯ (FSM) - МАКСИМАЛЬНО ДЕТАЛЬНО
-# ==============================================================================
-class Form(StatesGroup):
-    """Класс состояний для управления всеми процессами бота"""
-    
-    # Состояния для добавления нового клуба
-    adding_club_name = State()
-    adding_club_vld = State()
-    
-    # Состояния для управления расписанием
-    editing_schedule_text = State()
-    
-    # Состояния для создания матча (Исправлено!)
-    match_creating_step_1 = State() # Выбор команды 1
-    match_creating_step_2 = State() # Выбор команды 2
-    match_creating_step_3 = State() # Ввод времени
-    
-    # Состояния для глубокого редактирования матча
-    match_edit_select_id = State()
-    match_edit_main_menu = State()
-    match_edit_update_time = State()
-    match_edit_update_t1 = State()
-    match_edit_update_t2 = State()
-    
-    # Состояния для редактирования данных о клубе
-    club_edit_select_id = State()
-    club_edit_main_menu = State()
-    club_edit_update_name = State()
-    club_edit_update_vld = State()
-    club_edit_update_zam = State()
-    
-    # Состояния для процесса сдачи табов (скриншотов)
-    tabs_selecting_match = State()
-    tabs_upload_photo_1 = State()
-    tabs_upload_photo_2 = State()
-    
-    # Состояния для управления правами доступа (Админка)
-    admin_grant_id = State()
-    admin_revoke_id = State()
+bot = telebot.TeleBot(TOKEN)
+DATA_FILE = "tm_pro_v5_database.json"
 
-# ==============================================================================
-# БЛОК РАБОТЫ С БАЗОЙ ДАННЫХ (SQLITE3)
-# ==============================================================================
-def execute_db_query(query, params=(), fetchone=False, commit=False):
-    """
-    Универсальная функция для выполнения запросов к БД.
-    Включает обработку исключений и логирование ошибок.
-    """
-    db_name = 'league_data.db'
-    # Увеличен timeout для стабильной работы на облачных серверах
-    conn = sqlite3.connect(db_name, timeout=60)
-    cursor = conn.cursor()
-    result = None
-    
+logging.basicConfig(level=logging.INFO)
+
+# =================================================================
+# СИСТЕМА ДАННЫХ (JSON)
+# =================================================================
+
+def load_db():
+    """Загрузка базы данных с проверкой на существование"""
+    if not os.path.exists(DATA_FILE):
+        return {
+            "users": {},
+            "admins": [SUPER_ADMIN.lower()],
+            "config": {
+                "top_clubs_text": "🏆 ТОП КЛУБОВ\n(Настройте через админ-панель)",
+                "clubs_list_text": "📋 СПИСОК КЛУБОВ\n(Настройте через админ-панель)"
+            }
+        }
     try:
-        cursor.execute(query, params)
-        if commit:
-            conn.commit()
-            logger.info(f"Запрос выполнен успешно (COMMIT): {query[:50]}...")
-        
-        if fetchone:
-            result = cursor.fetchone()
-        else:
-            result = cursor.fetchall()
-            
-    except Exception as error:
-        logger.error(f"Критическая ошибка при работе с SQLite: {error}")
-        logger.error(f"Проблемный запрос: {query}")
-    finally:
-        conn.close()
-    return result
-
-def initialize_database_structure():
-    """Создание всех необходимых таблиц при старте бота"""
-    logger.info("Проверка и инициализация структуры базы данных...")
-    
-    # Таблица для хранения пользователей и их ролей
-    execute_db_query("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        role TEXT DEFAULT 'user'
-    )""", commit=True)
-    
-    # Таблица клубов (команд)
-    execute_db_query("""
-    CREATE TABLE IF NOT EXISTS clubs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        vld_id INTEGER NOT NULL,
-        zams TEXT DEFAULT ''
-    )""", commit=True)
-    
-    # Таблица матчей и их состояний
-    execute_db_query("""
-    CREATE TABLE IF NOT EXISTS matches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        t1_id INTEGER,
-        t2_id INTEGER,
-        time TEXT,
-        otpis1 INTEGER DEFAULT 0,
-        otpis2 INTEGER DEFAULT 0,
-        msg_id INTEGER,
-        vip_waiter INTEGER,
-        status TEXT DEFAULT 'active'
-    )""", commit=True)
-    
-    # Таблица общих настроек (например, текст расписания)
-    execute_db_query("""
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""", commit=True)
-    
-    # Проверка начальных настроек расписания
-    check_sched = execute_db_query("SELECT value FROM settings WHERE key='schedule'", fetchone=True)
-    if not check_sched:
-        execute_db_query("INSERT INTO settings (key, value) VALUES ('schedule', 'На текущий момент расписание отсутствует.')", commit=True)
-        logger.info("Создана дефолтная запись расписания.")
-
-# ==============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (КЛАВИАТУРЫ И ПРОВЕРКИ)
-# ==============================================================================
-async def check_is_admin(user_id: int):
-    """Проверка наличия прав администратора у пользователя"""
-    if user_id in SUPER_ADMINS:
-        return True
-    data = execute_db_query("SELECT role FROM users WHERE user_id=?", (user_id,), fetchone=True)
-    return data and data[0] == 'admin'
-
-def ui_main_menu_keyboard(user_id: int):
-    """Формирование главного меню бота (Reply кнопки)"""
-    builder = ReplyKeyboardBuilder()
-    builder.button(text="📅 Расписание матчей")
-    builder.button(text="📝 Дать отпись")
-    builder.button(text="📸 Дать табы")
-    
-    # Динамическая кнопка админки
-    user_role_data = execute_db_query("SELECT role FROM users WHERE user_id=?", (user_id,), fetchone=True)
-    if user_id in SUPER_ADMINS or (user_role_data and user_role_data[0] == 'admin'):
-        builder.button(text="⚙️ Админ панель")
-    
-    builder.adjust(2)
-    return builder.as_markup(resize_keyboard=True)
-
-def ui_admin_root_keyboard(user_id: int):
-    """Главная панель администратора (Inline кнопки)"""
-    builder = InlineKeyboardBuilder()
-    
-    # Секция управления клубами
-    builder.button(text="➕ Создать клуб", callback_data="btn_adm_club_add")
-    builder.button(text="📝 Изменить данные клуба", callback_data="btn_adm_club_edit_list")
-    builder.button(text="❌ Удалить клуб", callback_data="btn_adm_club_del_list")
-    
-    # Секция управления матчами
-    builder.button(text="⚽ Назначить матч", callback_data="btn_adm_match_create_start")
-    builder.button(text="🔄 Редактировать матч", callback_data="btn_adm_match_edit_list")
-    builder.button(text="🗑 Удалить матч", callback_data="btn_adm_match_del_list")
-    
-    # Глобальные настройки
-    builder.button(text="📅 Текст расписания", callback_data="btn_adm_sched_edit")
-    
-    # Секция супер-админа
-    if user_id in SUPER_ADMINS:
-        builder.button(text="👑 Назначить админа", callback_data="btn_adm_role_give")
-        builder.button(text="🔌 Снять админа", callback_data="btn_adm_role_revoke")
-    
-    builder.adjust(1)
-    return builder.as_markup()
-
-def ui_back_to_admin_button():
-    """Универсальная кнопка возврата в корень админки"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Вернуться в меню", callback_data="nav_to_admin_main")
-    return builder.as_markup()
-
-# ==============================================================================
-# ОБРАБОТЧИКИ БАЗОВЫХ КОМАНД (START, CANCEL)
-# ==============================================================================
-@dp.message(Command("start"))
-async def handler_command_start(message: Message, state: FSMContext):
-    """Обработка команды /start и регистрация пользователя"""
-    await state.clear()
-    uid = message.from_user.id
-    
-    # Регистрация пользователя в БД, если его нет
-    execute_db_query("INSERT OR IGNORE INTO users (user_id, role) VALUES (?, 'user')", (uid,), commit=True)
-    
-    welcome_msg = (
-        "👋 **Приветствуем в системе управления лигой!**\n\n"
-        "Этот бот поможет вам следить за расписанием, сдавать табы и управлять матчами.\n\n"
-        "Используйте кнопки меню ниже:"
-    )
-    await message.answer(welcome_msg, reply_markup=ui_main_menu_keyboard(uid), parse_mode="Markdown")
-    logger.info(f"Пользователь {uid} нажал старт.")
-
-@dp.callback_query(F.data == "nav_to_admin_main")
-async def handler_nav_admin_main(callback: CallbackQuery, state: FSMContext):
-    """Возврат в главное меню админки из любого состояния"""
-    await state.clear()
-    if not await check_is_admin(callback.from_user.id):
-        return await callback.answer("🚫 У вас нет прав доступа!", show_alert=True)
-        
-    await callback.message.edit_text(
-        "⚙️ **Панель управления администратора**\nВыберите нужный раздел:",
-        reply_markup=ui_admin_root_keyboard(callback.from_user.id),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.message(F.text == "⚙️ Админ панель")
-async def handler_open_admin_panel(message: Message, state: FSMContext):
-    """Открытие админки через кнопку Reply меню"""
-    await state.clear()
-    if not await check_is_admin(message.from_user.id):
-        return await message.answer("🚫 У вас нет доступа к этому разделу.")
-        
-    await message.answer(
-        "⚙️ **Панель управления администратора**\nВыберите нужный раздел:",
-        reply_markup=ui_admin_root_keyboard(message.from_user.id),
-        parse_mode="Markdown"
-    )
-
-# ==============================================================================
-# БЛОК ДОБАВЛЕНИЯ КЛУБА
-# ==============================================================================
-@dp.callback_query(F.data == "btn_adm_club_add")
-async def handler_club_add_step_1(callback: CallbackQuery, state: FSMContext):
-    """Запрос названия нового клуба"""
-    await state.set_state(Form.adding_club_name)
-    await callback.message.edit_text(
-        "📝 **Добавление нового клуба**\n\nВведите полное название команды:",
-        reply_markup=ui_back_to_admin_button(),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.message(Form.adding_club_name)
-async def handler_club_add_step_2(message: Message, state: FSMContext):
-    """Сохранение названия и запрос ID владельца"""
-    club_name = message.text.strip()
-    if len(club_name) < 2:
-        return await message.answer("❌ Название слишком короткое. Введите еще раз:")
-        
-    await state.update_data(temp_club_name=club_name)
-    await state.set_state(Form.adding_club_vld)
-    await message.answer(
-        f"✅ Название: **{club_name}**\n\nТеперь введите Telegram ID владельца клуба (ВЛД):",
-        reply_markup=ui_back_to_admin_button(),
-        parse_mode="Markdown"
-    )
-
-@dp.message(Form.adding_club_vld)
-async def handler_club_add_step_3(message: Message, state: FSMContext):
-    """Финальное сохранение клуба в базу данных"""
-    if not message.text.isdigit():
-        return await message.answer("❌ ID должен содержать только цифры. Повторите ввод:")
-        
-    vld_id = int(message.text)
-    data = await state.get_data()
-    c_name = data.get('temp_club_name')
-    
-    execute_db_query("INSERT INTO clubs (name, vld_id) VALUES (?, ?)", (c_name, vld_id), commit=True)
-    
-    await message.answer(
-        f"🎉 **Клуб успешно зарегистрирован!**\n\n🏷 Имя: {c_name}\n👤 ВЛД ID: `{vld_id}`",
-        reply_markup=ui_main_menu_keyboard(message.from_user.id),
-        parse_mode="Markdown"
-    )
-    await state.clear()
-    logger.info(f"Создан новый клуб: {c_name}")
-
-# ==============================================================================
-# БЛОК РЕДАКТИРОВАНИЯ КЛУБА (РАСШИРЕННЫЙ)
-# ==============================================================================
-@dp.callback_query(F.data == "btn_adm_club_edit_list")
-async def handler_club_edit_list(callback: CallbackQuery, state: FSMContext):
-    """Отображение списка всех клубов для редактирования"""
-    clubs = execute_db_query("SELECT id, name FROM clubs")
-    if not clubs:
-        return await callback.message.edit_text("❌ В базе данных пока нет клубов.", reply_markup=ui_back_to_admin_button())
-        
-    builder = InlineKeyboardBuilder()
-    for c in clubs:
-        builder.button(text=f"🛠 {c[1]}", callback_data=f"club_edit_id_{c[0]}")
-    
-    builder.button(text="🔙 Назад", callback_data="nav_to_admin_main")
-    builder.adjust(1)
-    
-    await state.set_state(Form.club_edit_select_id)
-    await callback.message.edit_text("Выберите клуб для изменения параметров:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("club_edit_id_"), Form.club_edit_select_id)
-async def handler_club_edit_menu(callback: CallbackQuery, state: FSMContext):
-    """Меню действий над выбранным клубом"""
-    club_id = callback.data.split("_")[3]
-    await state.update_data(current_edit_club_id=club_id)
-    
-    club_info = execute_db_query("SELECT name, vld_id, zams FROM clubs WHERE id=?", (club_id,), fetchone=True)
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🏷 Изменить имя", callback_data="field_club_name")
-    builder.button(text="👤 Изменить ВЛД", callback_data="field_club_vld")
-    builder.button(text="➕ Добавить зама", callback_data="field_club_addzam")
-    builder.button(text="🧹 Очистить замов", callback_data="field_club_clear")
-    builder.button(text="🔙 К списку", callback_data="btn_adm_club_edit_list")
-    builder.adjust(2)
-    
-    zams_display = club_info[2] if club_info[2] else "Список пуст"
-    await callback.message.edit_text(
-        f"📊 **Карточка клуба: {club_info[0]}**\n\n"
-        f"🆔 ВЛД ID: `{club_info[1]}`\n"
-        f"👥 Заместители: `{zams_display}`\n\n"
-        "Что именно вы хотите изменить?",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
-    )
-    await state.set_state(Form.club_edit_main_menu)
-    await callback.answer()
-
-@dp.callback_query(F.data == "field_club_name", Form.club_edit_main_menu)
-async def handler_club_edit_name_init(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите новое название для клуба:", reply_markup=ui_back_to_admin_button())
-    await state.set_state(Form.club_edit_update_name)
-
-@dp.message(Form.club_edit_update_name)
-async def handler_club_edit_name_save(message: Message, state: FSMContext):
-    data = await state.get_data()
-    cid = data.get('current_edit_club_id')
-    execute_db_query("UPDATE clubs SET name=? WHERE id=?", (message.text, cid), commit=True)
-    await message.answer(f"✅ Новое название **{message.text}** сохранено!", reply_markup=ui_main_menu_keyboard(message.from_user.id))
-    await state.clear()
-
-@dp.callback_query(F.data == "field_club_vld", Form.club_edit_main_menu)
-async def handler_club_edit_vld_init(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите новый ID владельца (только цифры):", reply_markup=ui_back_to_admin_button())
-    await state.set_state(Form.club_edit_update_vld)
-
-@dp.message(Form.club_edit_update_vld)
-async def handler_club_edit_vld_save(message: Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("❌ Ошибка: Введите числовой ID.")
-    data = await state.get_data()
-    cid = data.get('current_edit_club_id')
-    execute_db_query("UPDATE clubs SET vld_id=? WHERE id=?", (int(message.text), cid), commit=True)
-    await message.answer("✅ Новый владелец успешно назначен!", reply_markup=ui_main_menu_keyboard(message.from_user.id))
-    await state.clear()
-
-@dp.callback_query(F.data == "field_club_addzam", Form.club_edit_main_menu)
-async def handler_club_edit_zam_init(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите ID заместителя для добавления в список:", reply_markup=ui_back_to_admin_button())
-    await state.set_state(Form.club_edit_update_zam)
-
-@dp.message(Form.club_edit_update_zam)
-async def handler_club_edit_zam_save(message: Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("❌ Ошибка: Введите числовой ID.")
-    data = await state.get_data()
-    cid = data.get('current_edit_club_id')
-    
-    current_zams_data = execute_db_query("SELECT zams FROM clubs WHERE id=?", (cid,), fetchone=True)[0]
-    new_zams_string = f"{current_zams_data},{message.text}" if current_zams_data else message.text
-    
-    execute_db_query("UPDATE clubs SET zams=? WHERE id=?", (new_zams_string, cid), commit=True)
-    await message.answer("✅ Заместитель добавлен в список!", reply_markup=ui_main_menu_keyboard(message.from_user.id))
-    await state.clear()
-
-@dp.callback_query(F.data == "field_club_clear", Form.club_edit_main_menu)
-async def handler_club_edit_zam_clear(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    cid = data.get('current_edit_club_id')
-    execute_db_query("UPDATE clubs SET zams='' WHERE id=?", (cid,), commit=True)
-    await callback.answer("🧹 Список заместителей очищен!", show_alert=True)
-    await handler_club_edit_list(callback, state)
-
-# ==============================================================================
-# БЛОК УДАЛЕНИЯ КЛУБА
-# ==============================================================================
-@dp.callback_query(F.data == "btn_adm_club_del_list")
-async def handler_club_delete_list(callback: CallbackQuery):
-    """Выбор клуба для безвозвратного удаления"""
-    clubs = execute_db_query("SELECT id, name FROM clubs")
-    if not clubs:
-        return await callback.message.edit_text("❌ База пуста, удалять нечего.", reply_markup=ui_back_to_admin_button())
-        
-    builder = InlineKeyboardBuilder()
-    for c in clubs:
-        builder.button(text=f"🗑 Удалить {c[1]}", callback_data=f"club_delete_exec_{c[0]}")
-    
-    builder.button(text="🔙 Назад", callback_data="nav_to_admin_main")
-    builder.adjust(1)
-    await callback.message.edit_text("⚠️ **ВНИМАНИЕ!**\nВыбранный клуб будет удален навсегда:", reply_markup=builder.as_markup(), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("club_delete_exec_"))
-async def handler_club_delete_execute(callback: CallbackQuery):
-    cid = callback.data.split("_")[3]
-    execute_db_query("DELETE FROM clubs WHERE id=?", (cid,), commit=True)
-    await callback.answer("✅ Клуб успешно удален из системы.")
-    await handler_club_delete_list(callback)
-
-# ==============================================================================
-# БЛОК СОЗДАНИЯ МАТЧА (ИСПРАВЛЕННЫЙ И РАЗДУТЫЙ)
-# ==============================================================================
-@dp.callback_query(F.data == "btn_adm_match_create_start")
-async def handler_match_create_step_1(callback: CallbackQuery, state: FSMContext):
-    """Выбор Команды 1 (Хозяева)"""
-    await state.clear()
-    clubs_list = execute_db_query("SELECT id, name FROM clubs")
-    
-    if len(clubs_list) < 2:
-        return await callback.message.edit_text(
-            "❌ Для создания матча нужно хотя бы 2 клуба в базе!",
-            reply_markup=ui_back_to_admin_button()
-        )
-        
-    builder = InlineKeyboardBuilder()
-    for c in clubs_list:
-        # Важно: префикс f_t1_ помогает отличить выбор первой команды
-        builder.button(text=f"🏠 {c[1]}", callback_data=f"f_t1_{c[0]}")
-    
-    builder.button(text="🔙 Отмена", callback_data="nav_to_admin_main")
-    builder.adjust(2)
-    
-    await callback.message.edit_text(
-        "⚽ **Создание матча: Шаг 1**\n\nВыберите **ПЕРВУЮ** команду (Хозяева):",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
-    )
-    await state.set_state(Form.match_creating_step_1)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("f_t1_"), Form.match_creating_step_1)
-async def handler_match_create_step_2(callback: CallbackQuery, state: FSMContext):
-    """Выбор Команды 2 (Гости)"""
-    t1_id = callback.data.split("_")[2]
-    await state.update_data(created_match_t1=t1_id)
-    
-    # Исключаем из списка уже выбранную команду
-    clubs_for_t2 = execute_db_query("SELECT id, name FROM clubs WHERE id != ?", (t1_id,))
-    
-    builder = InlineKeyboardBuilder()
-    for c in clubs_for_t2:
-        # Важно: префикс f_t2_ помогает отличить выбор второй команды
-        builder.button(text=f"✈️ {c[1]}", callback_data=f"f_t2_{c[0]}")
-    
-    builder.button(text="🔙 Назад к выбору команды 1", callback_data="btn_adm_match_create_start")
-    builder.adjust(2)
-    
-    await callback.message.edit_text(
-        "⚽ **Создание матча: Шаг 2**\n\nВыберите **ВТОРУЮ** команду (Гости):",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
-    )
-    await state.set_state(Form.match_creating_step_2)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("f_t2_"), Form.match_creating_step_2)
-async def handler_match_create_step_3(callback: CallbackQuery, state: FSMContext):
-    """Запрос времени матча"""
-    t2_id = callback.data.split("_")[2]
-    await state.update_data(created_match_t2=t2_id)
-    
-    await callback.message.edit_text(
-        "⏰ **Создание матча: Шаг 3**\n\nВведите время и дату матча текстом:\n_(Пример: Сегодня в 21:00)_",
-        reply_markup=ui_back_to_admin_button(),
-        parse_mode="Markdown"
-    )
-    await state.set_state(Form.match_creating_step_3)
-    await callback.answer()
-
-@dp.message(Form.match_creating_step_3)
-async def handler_match_create_final(message: Message, state: FSMContext):
-    """Публикация матча в канал и запись в БД"""
-    match_time_string = message.text.strip()
-    data = await state.get_data()
-    
-    t1_id = data.get('created_match_t1')
-    t2_id = data.get('created_match_t2')
-    
-    # Получаем названия для поста
-    name_1 = execute_db_query("SELECT name FROM clubs WHERE id=?", (t1_id,), fetchone=True)[0]
-    name_2 = execute_db_query("SELECT name FROM clubs WHERE id=?", (t2_id,), fetchone=True)[0]
-    
-    post_content = (
-        f"🏟 **ЗАПЛАНИРОВАН МАТЧ ТУРА**\n\n"
-        f"⚽ **{name_1}** VS **{name_2}**\n"
-        f"📅 Начало: `{match_time_string}`\n\n"
-        f"📊 **Статус подтверждения:**\n"
-        f"1️⃣ {name_1}: ❌\n"
-        f"2️⃣ {name_2}: ❌\n\n"
-        f"Регистрация на матч через: {BOT_USERNAME}"
-    )
-    
-    try:
-        # Отправляем сообщение в основной канал лиги
-        sent_msg = await bot.send_message(CHANNEL_ID, post_content, parse_mode="Markdown")
-        
-        # Записываем матч в базу
-        execute_db_query(
-            "INSERT INTO matches (t1_id, t2_id, time, msg_id) VALUES (?, ?, ?, ?)",
-            (t1_id, t2_id, match_time_string, sent_msg.message_id),
-            commit=True
-        )
-        
-        await message.answer(
-            "✅ **Матч успешно опубликован в канале!**",
-            reply_markup=ui_main_menu_keyboard(message.from_user.id),
-            parse_mode="Markdown"
-        )
-        logger.info(f"Матч {name_1} - {name_2} создан.")
-        
-    except Exception as e:
-        await message.answer(f"❌ Ошибка при публикации матча: {e}")
-        logger.error(f"Ошибка публикации: {e}")
-        
-    await state.clear()
-
-# ==============================================================================
-# БЛОК РЕДАКТИРОВАНИЯ И УДАЛЕНИЯ МАТЧЕЙ
-# ==============================================================================
-@dp.callback_query(F.data == "btn_adm_match_edit_list")
-async def handler_match_edit_list(callback: CallbackQuery, state: FSMContext):
-    """Выбор активного матча для редактирования"""
-    matches = execute_db_query("SELECT id, t1_id, t2_id, time FROM matches WHERE status='active' ORDER BY id DESC LIMIT 15")
-    if not matches:
-        return await callback.message.edit_text("❌ Активных матчей не найдено.", reply_markup=ui_back_to_admin_button())
-        
-    builder = InlineKeyboardBuilder()
-    for m in matches:
-        n1 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[1],), fetchone=True)[0]
-        n2 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[2],), fetchone=True)[0]
-        builder.button(text=f"⚙️ {n1}-{n2} ({m[3]})", callback_data=f"match_edit_id_{m[0]}")
-    
-    builder.button(text="🔙 Назад", callback_data="nav_to_admin_main")
-    builder.adjust(1)
-    
-    await state.set_state(Form.match_edit_select_id)
-    await callback.message.edit_text("Выберите матч для внесения изменений:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("match_edit_id_"), Form.match_edit_select_id)
-async def handler_match_edit_menu(callback: CallbackQuery, state: FSMContext):
-    """Меню управления полями матча"""
-    mid = callback.data.split("_")[3]
-    await state.update_data(current_edit_match_id=mid)
-    
-    m_data = execute_db_query("SELECT t1_id, t2_id, time FROM matches WHERE id=?", (mid,), fetchone=True)
-    n1 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m_data[0],), fetchone=True)[0]
-    n2 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m_data[1],), fetchone=True)[0]
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⏰ Время начала", callback_data="field_match_time")
-    builder.button(text="👕 Команда 1", callback_data="field_match_t1")
-    builder.button(text="👕 Команда 2", callback_data="field_match_t2")
-    builder.button(text="🔙 К списку", callback_data="btn_adm_match_edit_list")
-    builder.adjust(1)
-    
-    await callback.message.edit_text(
-        f"🔄 **Матч #{mid}**\n\n⚔️ {n1} VS {n2}\n⏰ Время: `{m_data[2]}`\n\nЧто изменить?",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
-    )
-    await state.set_state(Form.match_edit_main_menu)
-    await callback.answer()
-
-@dp.callback_query(F.data == "field_match_time", Form.match_edit_main_menu)
-async def handler_match_edit_time_init(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите новое время для этого матча:", reply_markup=ui_back_to_admin_button())
-    await state.set_state(Form.match_edit_update_time)
-
-@dp.message(Form.match_edit_update_time)
-async def handler_match_edit_time_save(message: Message, state: FSMContext):
-    data = await state.get_data()
-    mid = data.get('current_edit_match_id')
-    execute_db_query("UPDATE matches SET time=? WHERE id=?", (message.text, mid), commit=True)
-    await message.answer("✅ Время матча обновлено!", reply_markup=ui_main_menu_keyboard(message.from_user.id))
-    await state.clear()
-
-@dp.callback_query(F.data == "btn_adm_match_del_list")
-async def handler_match_delete_list(callback: CallbackQuery):
-    """Список матчей для быстрого удаления"""
-    matches = execute_db_query("SELECT id, t1_id, t2_id, time FROM matches ORDER BY id DESC LIMIT 10")
-    if not matches:
-        return await callback.message.edit_text("❌ Матчей нет.", reply_markup=ui_back_to_admin_button())
-        
-    builder = InlineKeyboardBuilder()
-    for m in matches:
-        n1 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[1],), fetchone=True)[0]
-        n2 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[2],), fetchone=True)[0]
-        builder.button(text=f"🗑 Удалить {n1}-{n2}", callback_data=f"match_del_exec_{m[0]}")
-    
-    builder.button(text="🔙 Назад", callback_data="nav_to_admin_main")
-    builder.adjust(1)
-    await callback.message.edit_text("Выберите матч для удаления:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("match_del_exec_"))
-async def handler_match_delete_execute(callback: CallbackQuery):
-    mid = callback.data.split("_")[3]
-    execute_db_query("DELETE FROM matches WHERE id=?", (mid,), commit=True)
-    await callback.answer("✅ Матч удален.")
-    await handler_match_delete_list(callback)
-
-# ==============================================================================
-# БЛОК РАСПИСАНИЯ И УПРАВЛЕНИЯ ПРАВАМИ
-# ==============================================================================
-@dp.message(F.text == "📅 Расписание матчей")
-async def handler_user_show_schedule(message: Message):
-    """Показ актуального расписания любому пользователю"""
-    sched_data = execute_db_query("SELECT value FROM settings WHERE key='schedule'", fetchone=True)
-    await message.answer(
-        f"📅 **Актуальное расписание лиги:**\n\n{sched_data[0]}",
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "btn_adm_sched_edit")
-async def handler_admin_edit_sched_init(callback: CallbackQuery, state: FSMContext):
-    """Инициализация смены текста расписания"""
-    await callback.message.edit_text(
-        "Введите новый текст для раздела расписания.\nМожно использовать Markdown разметку:",
-        reply_markup=ui_back_to_admin_button()
-    )
-    await state.set_state(Form.editing_schedule_text)
-    await callback.answer()
-
-@dp.message(Form.editing_schedule_text)
-async def handler_admin_edit_sched_save(message: Message, state: FSMContext):
-    execute_db_query("UPDATE settings SET value=? WHERE key='schedule'", (message.text,), commit=True)
-    await message.answer("✅ Текст расписания успешно обновлен!", reply_markup=ui_main_menu_keyboard(message.from_user.id))
-    await state.clear()
-
-@dp.callback_query(F.data == "btn_adm_role_give")
-async def handler_admin_grant_init(callback: CallbackQuery, state: FSMContext):
-    """Назначение нового админа по ID"""
-    await callback.message.edit_text("Введите Telegram ID человека, которому нужно выдать админ-права:", reply_markup=ui_back_to_admin_button())
-    await state.set_state(Form.admin_grant_id)
-    await callback.answer()
-
-@dp.message(Form.admin_grant_id)
-async def handler_admin_grant_save(message: Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("❌ Введите числовой ID:")
-    execute_db_query("INSERT OR REPLACE INTO users (user_id, role) VALUES (?, 'admin')", (int(message.text),), commit=True)
-    await message.answer(f"✅ Пользователь `{message.text}` теперь администратор!", reply_markup=ui_main_menu_keyboard(message.from_user.id), parse_mode="Markdown")
-    await state.clear()
-
-@dp.callback_query(F.data == "btn_adm_role_revoke")
-async def handler_admin_revoke_init(callback: CallbackQuery, state: FSMContext):
-    """Список текущих админов для снятия прав"""
-    admins_list = execute_db_query("SELECT user_id FROM users WHERE role='admin'")
-    if not admins_list:
-        return await callback.message.edit_text("❌ Дополнительных администраторов не найдено.", reply_markup=ui_back_to_admin_button())
-        
-    text_list = "\n".join([f"• `{a[0]}`" for a in admins_list])
-    await callback.message.edit_text(f"**Список текущих админов:**\n{text_list}\n\nВведите ID для снятия прав:", reply_markup=ui_back_to_admin_button(), parse_mode="Markdown")
-    await state.set_state(Form.admin_revoke_id)
-    await callback.answer()
-
-@dp.message(Form.admin_revoke_id)
-async def handler_admin_revoke_save(message: Message, state: FSMContext):
-    execute_db_query("UPDATE users SET role='user' WHERE user_id=?", (int(message.text),), commit=True)
-    await message.answer(f"✅ Права у пользователя `{message.text}` отозваны.", reply_markup=ui_main_menu_keyboard(message.from_user.id), parse_mode="Markdown")
-    await state.clear()
-
-# ==============================================================================
-# БЛОК ОТПИСИ НА МАТЧ (ЛОГИКА ДЛЯ ВЛД И ЗАМОВ)
-# ==============================================================================
-@dp.message(F.text == "📝 Дать отпись")
-async def handler_user_otpis_start(message: Message):
-    """Список матчей, где еще не подтверждено участие команды игрока"""
-    # Ищем матчи, где хотя бы одна команда не отписалась
-    active_otpis_matches = execute_db_query("SELECT id, t1_id, t2_id FROM matches WHERE otpis1=0 OR otpis2=0")
-    if not active_otpis_matches:
-        return await message.answer("❌ На текущий момент нет активных отписей.")
-        
-    builder = InlineKeyboardBuilder()
-    for m in active_otpis_matches:
-        n1 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[1],), fetchone=True)[0]
-        n2 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[2],), fetchone=True)[0]
-        builder.button(text=f"📝 {n1} VS {n2}", callback_data=f"otpis_action_{m[0]}")
-    
-    builder.adjust(1)
-    await message.answer("Выберите матч, за который ваш клуб должен отписаться:", reply_markup=builder.as_markup())
-
-@dp.callback_query(F.data.startswith("otpis_action_"))
-async def handler_user_otpis_execute(callback: CallbackQuery):
-    """Проверка прав и фиксация отписи"""
-    mid = callback.data.split("_")[2]
-    match = execute_db_query("SELECT * FROM matches WHERE id=?", (mid,), fetchone=True)
-    uid = str(callback.from_user.id)
-    
-    # Данные о командах в матче
-    club1 = execute_db_query("SELECT vld_id, zams, name FROM clubs WHERE id=?", (match[1],), fetchone=True)
-    club2 = execute_db_query("SELECT vld_id, zams, name FROM clubs WHERE id=?", (match[2],), fetchone=True)
-    
-    # Проверяем, к какому клубу относится пользователь
-    target_side = None
-    if uid == str(club1[0]) or uid in str(club1[1]).split(","):
-        target_side = "otpis1"
-    elif uid == str(club2[0]) or uid in str(club2[1]).split(","):
-        target_side = "otpis2"
-        
-    if not target_side:
-        return await callback.answer("🚫 Ошибка: Вы не являетесь ВЛД или замом этих команд!", show_alert=True)
-        
-    # Обновляем статус в БД
-    execute_db_query(f"UPDATE matches SET {target_side}=1 WHERE id=?", (mid,), commit=True)
-    await callback.answer("✅ Вы успешно отписались за свой клуб!")
-    
-    # Обновляем пост в канале
-    updated_match = execute_db_query("SELECT * FROM matches WHERE id=?", (mid,), fetchone=True)
-    s1 = "✅" if updated_match[4] else "❌"
-    s2 = "✅" if updated_match[5] else "❌"
-    
-    upd_content = (
-        f"🏟 **ОБНОВЛЕНИЕ МАТЧА**\n\n"
-        f"⚽ **{club1[2]}** VS **{club2[2]}**\n"
-        f"📅 Время: `{updated_match[3]}`\n\n"
-        f"📊 **Статус подтверждения:**\n"
-        f"1️⃣ {club1[2]}: {s1}\n"
-        f"2️⃣ {club2[2]}: {s2}"
-    )
-    
-    try:
-        await bot.edit_message_text(upd_content, CHANNEL_ID, updated_match[6], parse_mode="Markdown")
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except:
-        pass # Если сообщение уже удалено или не изменилось
+        return {"users": {}, "admins": [SUPER_ADMIN.lower()], "config": {}}
+
+def save_db(data):
+    """Сохранение базы данных"""
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+# =================================================================
+# СИСТЕМА ТАЙМЕРОВ (КД)
+# =================================================================
+
+def check_cooldown(user_id, username, action, seconds):
+    """
+    Проверка кулдауна.
+    ДЛЯ ВЛАДЕЛЬЦА (@Nazikrrk) И АДМИНОВ КД ВСЕГДА 0.
+    """
+    db = load_db()
+    uname_low = (username or "").lower()
+    
+    # Если ты или админ — ограничений нет
+    if uname_low in db["admins"]:
+        return False, 0
+    
+    uid_str = str(user_id)
+    if uid_str not in db["users"]:
+        return False, 0
+    
+    last_time = db["users"][uid_str].get("cooldowns", {}).get(action, 0)
+    diff = time.time() - last_time
+    
+    if diff < seconds:
+        return True, int(seconds - diff)
+    return False, 0
+
+def set_cooldown(user_id, action):
+    """Запись времени последнего действия"""
+    db = load_db()
+    uid_str = str(user_id)
+    if "cooldowns" not in db["users"][uid_str]:
+        db["users"][uid_str]["cooldowns"] = {}
+    db["users"][uid_str]["cooldowns"][action] = time.time()
+    save_db(db)
+
+# =================================================================
+# ИНТЕРФЕЙС (КЛАВИАТУРЫ)
+# =================================================================
+
+def get_main_kb(user_id, username):
+    db = load_db()
+    uid_str = str(user_id)
+    u_info = db["users"].get(uid_str, {})
+    uname_low = (username or "").lower()
+    is_admin = uname_low in db["admins"]
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    
+    if is_admin:
+        markup.add(types.KeyboardButton("👑 Админ Панель"))
+
+    if u_info.get("is_retired"):
+        markup.add(types.KeyboardButton("Возвращение карьеры 🔙"))
+        markup.add(types.KeyboardButton("Написать админам 📩"))
+        markup.add(types.KeyboardButton("Список клубов 📋"), types.KeyboardButton("Топ клубов 🏆"))
+        markup.add(types.KeyboardButton("Профиль 👤"))
+        return markup
+
+    markup.add(types.KeyboardButton("Свободный агент 🆓"), types.KeyboardButton("Свой текст 📝"))
+    
+    # Проверка прав на трансферы (Владельцы, Личные влд, Админы)
+    is_owner = (uname_low in CLUB_OWNERS_LIST or u_info.get("owned_club") or is_admin)
+    if is_owner:
+        markup.add(types.KeyboardButton("Предложить трансфер 🤝"))
+
+    markup.add(types.KeyboardButton("Список клубов 📋"), types.KeyboardButton("Топ клубов 🏆"))
+    markup.add(types.KeyboardButton("Профиль 👤"), types.KeyboardButton("Изменить ник ✏️"))
+    markup.add(types.KeyboardButton("Написать админам 📩"), types.KeyboardButton("Завершение карьеры 🚫"))
+    
+    return markup
+
+def get_admin_kb(username):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("🚫 Забанить", "✅ Разбанить")
+    markup.add("🔑 Дать влд", "🗑 Снять влд")
+    
+    if username.lower() == SUPER_ADMIN.lower():
+        markup.add("⭐ Дать админку", "❌ Снять админку")
         
-    # Если отписались обе стороны - выбираем, кто создает VIP
-    if updated_match[4] == 1 and updated_match[5] == 1:
-        winner_id = random.choice([club1[0], club2[0]])
-        execute_db_query("UPDATE matches SET vip_waiter=? WHERE id=?", (winner_id, mid), commit=True)
-        await bot.send_message(winner_id, "🎲 **Жребий выпал вам!**\nВы должны создать VIP матч. Когда создадите, пришлите данные в бот сообщением вида:\n`вип:Текст данных`")
+    markup.add("📝 Изменить список", "🔥 Изменить ТОП")
+    markup.add("🔙 Назад в меню")
+    return markup
 
-# ==============================================================================
-# БЛОК СДАЧИ ТАБОВ (СКРИНШОТОВ)
-# ==============================================================================
-@dp.message(F.text == "📸 Дать табы")
-async def handler_tabs_start(message: Message, state: FSMContext):
-    """Начало процесса сдачи скриншотов"""
-    # Выбираем матчи, где отписались оба
-    matches = execute_db_query("SELECT id, t1_id, t2_id FROM matches WHERE otpis1=1 AND otpis2=1")
-    if not matches:
-        return await message.answer("❌ На данный момент нет матчей для сдачи табов.")
+def get_cancel_kb():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("Отмена 🔙")
+    return markup
+
+# =================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =================================================================
+
+def find_user_by_username(target_username):
+    target_username = target_username.replace("@", "").lower().strip()
+    db = load_db()
+    for uid, info in db["users"].items():
+        if info.get("username") == target_username:
+            return uid
+    return None
+
+# =================================================================
+# ОБРАБОТЧИКИ ШАГОВ (NEXT STEP)
+# =================================================================
+
+def step_register_nickname(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "❌ Регистрация прервана. Напишите /start снова.", reply_markup=types.ReplyKeyboardRemove())
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "⚠️ Введите текст ника:")
+        bot.register_next_step_handler(msg, step_register_nickname)
+        return
         
-    builder = InlineKeyboardBuilder()
-    for m in matches:
-        n1 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[1],), fetchone=True)[0]
-        n2 = execute_db_query("SELECT name FROM clubs WHERE id=?", (m[2],), fetchone=True)[0]
-        builder.button(text=f"📸 {n1} - {n2}", callback_data=f"tabs_match_id_{m[0]}")
-    
-    builder.adjust(1)
-    await message.answer("Выберите ваш матч из списка:", reply_markup=builder.as_markup())
-    await state.set_state(Form.tabs_selecting_match)
+    db = load_db()
+    db["users"][str(message.from_user.id)]["rb_nick"] = message.text.strip()
+    save_db(db)
+    bot.send_message(message.chat.id, f"✅ Ник {message.text} сохранен!", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
 
-@dp.callback_query(F.data.startswith("tabs_match_id_"), Form.tabs_selecting_match)
-async def handler_tabs_photo_1_init(callback: CallbackQuery, state: FSMContext):
-    mid = callback.data.split("_")[3]
-    m_info = execute_db_query("SELECT t1_id, t2_id FROM matches WHERE id=?", (mid,), fetchone=True)
-    uid = str(callback.from_user.id)
+def step_change_nickname(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
+        return
     
-    c1 = execute_db_query("SELECT vld_id, zams, name FROM clubs WHERE id=?", (m_info[0],), fetchone=True)
-    c2 = execute_db_query("SELECT vld_id, zams, name FROM clubs WHERE id=?", (m_info[1],), fetchone=True)
-    
-    acting_club = None
-    if uid == str(c1[0]) or uid in str(c1[1]).split(","): acting_club = c1[2]
-    elif uid == str(c2[0]) or uid in str(c2[1]).split(","): acting_club = c2[2]
-    
-    if not acting_club:
-        return await callback.answer("🚫 У вас нет прав для сдачи табов этого матча!", show_alert=True)
-        
-    await state.update_data(tabs_active_club=acting_club)
-    await callback.message.answer(f"📤 Команда: **{acting_club}**\nПожалуйста, отправьте скриншот **1 тайма**:", parse_mode="Markdown")
-    await state.set_state(Form.tabs_upload_photo_1)
-    await callback.answer()
+    on_cd, wait = check_cooldown(message.from_user.id, message.from_user.username, "nick_change", 604800) # 7 дней
+    if on_cd:
+        bot.send_message(message.chat.id, f"⚠️ Лимит смены ника! Осталось ждать: {wait // 3600} часов.")
+        return
 
-@dp.message(Form.tabs_upload_photo_1, F.photo)
-async def handler_tabs_photo_2_init(message: Message, state: FSMContext):
-    """Прием первого фото и запрос второго"""
-    file_id_1 = message.photo[-1].file_id
-    await state.update_data(tabs_file_1=file_id_1)
-    await message.answer("✅ Получено. Теперь отправьте скриншот **2 тайма**:", parse_mode="Markdown")
-    await state.set_state(Form.tabs_upload_photo_2)
+    db = load_db()
+    db["users"][str(message.from_user.id)]["rb_nick"] = message.text.strip()
+    save_db(db)
+    set_cooldown(message.from_user.id, "nick_change")
+    bot.send_message(message.chat.id, "✅ Ник успешно изменен!", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
 
-@dp.message(Form.tabs_upload_photo_2, F.photo)
-async def handler_tabs_finish(message: Message, state: FSMContext):
-    """Финальная отправка табов админам"""
-    file_id_2 = message.photo[-1].file_id
-    data = await state.get_data()
-    club_name = data.get('tabs_active_club')
-    file_1 = data.get('tabs_file_1')
+def step_send_report(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
+        return
     
-    # Рассылка админам
-    for admin in SUPER_ADMINS:
-        try:
-            await bot.send_message(admin, f"📸 **НОВЫЕ ТАБЫ**\nКоманда: {club_name}\nОтправил: @{message.from_user.username}")
-            await bot.send_photo(admin, file_1, caption="Тайм 1")
-            await bot.send_photo(admin, file_id_2, caption="Тайм 2")
-        except:
-            pass
-            
-    await message.answer("✅ Табы успешно отправлены администрации!", reply_markup=ui_main_menu_keyboard(message.from_user.id))
-    await state.clear()
+    on_cd, wait = check_cooldown(message.from_user.id, message.from_user.username, "report", 1200) # 20 мин
+    if on_cd:
+        bot.send_message(message.chat.id, f"⚠️ Слишком часто! Ждите {wait // 60} мин.")
+        return
 
-# ==============================================================================
-# БЛОК ПЕРЕДАЧИ ДАННЫХ VIP
-# ==============================================================================
-@dp.message(F.text.startswith("вип:"))
-async def handler_vip_transfer(message: Message):
-    """Передача VIP данных сопернику"""
-    uid = message.from_user.id
-    # Ищем последний матч пользователя, где он назначен создателем VIP
-    active_m = execute_db_query("SELECT t1_id, t2_id FROM matches WHERE vip_waiter=? ORDER BY id DESC LIMIT 1", (uid,), fetchone=True)
+    db = load_db()
+    sender = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+    alert = f"📩 **ОБРАЩЕНИЕ К АДМИНАМ**\n👤 От: {sender}\n💬 Текст: {message.text}"
     
-    if not active_m:
-        return await message.answer("❌ Вы сейчас не должны создавать VIP или данные уже переданы.")
-        
-    # Вычисляем соперника
-    vld_1 = execute_db_query("SELECT vld_id FROM clubs WHERE id=?", (active_m[0],), fetchone=True)[0]
-    vld_2 = execute_db_query("SELECT vld_id FROM clubs WHERE id=?", (active_m[1],), fetchone=True)[0]
+    sent = False
+    for adm_name in db["admins"]:
+        adm_id = find_user_by_username(adm_name)
+        if adm_id:
+            try:
+                bot.send_message(adm_id, alert, parse_mode="Markdown")
+                sent = True
+            except: pass
     
-    opponent_id = vld_1 if uid == vld_2 else vld_2
+    if sent:
+        set_cooldown(message.from_user.id, "report")
+        bot.send_message(message.chat.id, "✅ Ваше сообщение отправлено админам!", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
+    else:
+        bot.send_message(message.chat.id, "❌ Сейчас нет активных админов.")
+
+def step_custom_announcement(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
+        return
     
-    vip_text = message.text.replace("вип:", "").strip()
+    # КД 12 часов
+    on_cd, wait = check_cooldown(message.from_user.id, message.from_user.username, "announcement", 43200)
+    if on_cd:
+        bot.send_message(message.chat.id, f"⚠️ Вы сможете написать через {wait // 3600} ч. { (wait % 3600) // 60 } мин.")
+        return
+
+    db = load_db()
+    nick = db["users"][str(message.from_user.id)].get("rb_nick", "Игрок")
+    tag = f"@{message.from_user.username}" if message.from_user.username else "Скрыт"
     
     try:
-        await bot.send_message(opponent_id, f"📩 **ДАННЫЕ VIP ОТ СОПЕРНИКА:**\n\n`{vip_text}`", parse_mode="Markdown")
-        await message.answer("✅ Данные успешно переданы вашему сопернику!")
-        # Сбрасываем ожидание
-        execute_db_query("UPDATE matches SET vip_waiter=0 WHERE vip_waiter=?", (uid,), commit=True)
+        # Отправляем БЕЗ Markdown чтобы не ловить ошибку 400 на спецсимволах пользователя
+        final_msg = f"📝 НОВОЕ СООБЩЕНИЕ\n👤 От: {nick} ({tag})\n💬 Текст: {message.text}"
+        bot.send_message(CHANNEL_ID, final_msg)
+        set_cooldown(message.from_user.id, "announcement")
+        bot.send_message(message.chat.id, "✅ Опубликовано в канале!", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
     except Exception as e:
-        await message.answer("❌ Не удалось отправить данные сопернику (возможно, он заблокировал бота).")
+        bot.send_message(message.chat.id, "❌ Бот не может отправить сообщение в канал. Проверьте права.")
 
-# ==============================================================================
-# ЗАПУСК БОТА (ENTRY POINT)
-# ==============================================================================
-async def main_execution_loop():
-    """Главная функция запуска бота"""
-    # Сначала база
-    initialize_database_structure()
+def step_send_contract(message, club):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
+        return
     
-    # Настройка команд в меню
-    await bot.set_my_commands(
-        [BotCommand(command="start", description="Перезапустить бота и обновить меню")], 
-        scope=BotCommandScopeDefault()
-    )
+    target_uid = find_user_by_username(message.text)
+    if not target_uid:
+        bot.send_message(message.chat.id, "❌ Пользователь не найден в базе бота.")
+        return
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✅ Принять", callback_data=f"tr_yes_{message.from_user.id}"),
+           types.InlineKeyboardButton("❌ Отклонить", callback_data=f"tr_no_{message.from_user.id}"))
     
-    logger.info("--- БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ ---")
-    
-    # Запуск поллинга
     try:
-        await dp.start_polling(bot)
-    except Exception as poll_error:
-        logger.error(f"Ошибка поллинга: {poll_error}")
-    finally:
-        await bot.session.close()
+        bot.send_message(target_uid, f"⚽️ **ВАМ ПРЕДЛОЖИЛИ КОНТРАКТ!**\n🏢 Клуб: {club}\n👤 Отправитель: @{message.from_user.username}", reply_markup=kb, parse_mode="Markdown")
+        bot.send_message(message.chat.id, "✅ Запрос отправлен игроку!", reply_markup=get_main_kb(message.from_user.id, message.from_user.username))
+    except:
+        bot.send_message(message.chat.id, "❌ Не удалось отправить сообщение игроку.")
+
+# =================================================================
+# АДМИНИСТРАТИВНЫЕ ФУНКЦИИ (ПОДРОБНО)
+# =================================================================
+
+def step_admin_ban(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_admin_kb(message.from_user.username))
+        return
+    uid = find_user_by_username(message.text)
+    if uid:
+        db = load_db()
+        db["users"][uid]["is_banned"] = True
+        save_db(db)
+        bot.send_message(message.chat.id, f"✅ @{message.text} забанен!")
+    else:
+        bot.send_message(message.chat.id, "❌ Не найден.")
+
+def step_admin_unban(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_admin_kb(message.from_user.username))
+        return
+    uid = find_user_by_username(message.text)
+    if uid:
+        db = load_db()
+        db["users"][uid]["is_banned"] = False
+        save_db(db)
+        bot.send_message(message.chat.id, f"✅ @{message.text} разбанен!")
+    else:
+        bot.send_message(message.chat.id, "❌ Не найден.")
+
+def step_admin_add_admin(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_admin_kb(SUPER_ADMIN))
+        return
+    tag = message.text.replace("@", "").lower().strip()
+    db = load_db()
+    if tag not in db["admins"]:
+        db["admins"].append(tag)
+        save_db(db)
+        bot.send_message(message.chat.id, f"✅ @{tag} теперь администратор!")
+    else:
+        bot.send_message(message.chat.id, "⚠️ Уже в списке.")
+
+def step_admin_edit_list(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_admin_kb(message.from_user.username))
+        return
+    db = load_db()
+    db["config"]["clubs_list_text"] = message.text
+    save_db(db)
+    bot.send_message(message.chat.id, "✅ Список клубов обновлен!")
+
+def step_admin_edit_top(message):
+    if message.text == "Отмена 🔙":
+        bot.send_message(message.chat.id, "🏠 Отмена.", reply_markup=get_admin_kb(message.from_user.username))
+        return
+    db = load_db()
+    db["config"]["top_clubs_text"] = message.text
+    save_db(db)
+    bot.send_message(message.chat.id, "✅ ТОП обновлен!")
+
+# =================================================================
+# ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ
+# =================================================================
+
+@bot.message_handler(commands=['start'])
+def cmd_start_handler(message):
+    bot.clear_step_handler_by_chat_id(message.chat.id)
+    db = load_db()
+    uid = str(message.from_user.id)
+    uname = (message.from_user.username or "нет").lower()
+    
+    if uid not in db["users"]:
+        db["users"][uid] = {
+            "username": uname,
+            "rb_nick": None,
+            "is_retired": False,
+            "is_banned": False,
+            "owned_club": None,
+            "cooldowns": {}
+        }
+    else:
+        db["users"][uid]["username"] = uname
+    
+    save_db(db)
+
+    # Проверка на бан
+    if db["users"][uid].get("is_banned") and uname != SUPER_ADMIN.lower():
+        bot.send_message(message.chat.id, "🚫 Вы заблокированы администрацией.")
+        return
+
+    # Если ник не введен
+    if not db["users"][uid].get("rb_nick"):
+        msg = bot.send_message(message.chat.id, "👋 Привет! Для работы с ботом введи свой ник в Roblox:", reply_markup=get_cancel_kb())
+        bot.register_next_step_handler(msg, step_register_nickname)
+    else:
+        bot.send_message(message.chat.id, "🔘 Выберите нужный раздел:", reply_markup=get_main_kb(message.from_user.id, uname))
+
+@bot.message_handler(content_types=['text'])
+def text_handler(message):
+    uid = str(message.from_user.id)
+    uname = (message.from_user.username or "").lower()
+    db = load_db()
+    
+    if uid not in db["users"]: return
+    u_info = db["users"][uid]
+    is_admin = uname in db["admins"]
+
+    # Блок забаненных
+    if u_info.get("is_banned") and uname != SUPER_ADMIN.lower(): return
+
+    # --- КНОПКИ АДМИНА ---
+    if message.text == "👑 Админ Панель" and is_admin:
+        bot.send_message(message.chat.id, "🛠 Режим администратора:", reply_markup=get_admin_kb(uname))
+        return
+
+    if message.text == "🔙 Назад в меню":
+        bot.send_message(message.chat.id, "🏠 Главное меню:", reply_markup=get_main_kb(message.from_user.id, uname))
+        return
+
+    if is_admin:
+        if message.text == "🚫 Забанить":
+            m = bot.send_message(message.chat.id, "Введите @username для бана:", reply_markup=get_cancel_kb())
+            bot.register_next_step_handler(m, step_admin_ban)
+            return
+        elif message.text == "✅ Разбанить":
+            m = bot.send_message(message.chat.id, "Введите @username для разбана:", reply_markup=get_cancel_kb())
+            bot.register_next_step_handler(m, step_admin_unban)
+            return
+        elif message.text == "⭐ Дать админку" and uname == SUPER_ADMIN.lower():
+            m = bot.send_message(message.chat.id, "Введите @username:", reply_markup=get_cancel_kb())
+            bot.register_next_step_handler(m, step_admin_add_admin)
+            return
+        elif message.text == "📝 Изменить список":
+            m = bot.send_message(message.chat.id, "Введите новый текст списка клубов:", reply_markup=get_cancel_kb())
+            bot.register_next_step_handler(m, step_admin_edit_list)
+            return
+        elif message.text == "🔥 Изменить ТОП":
+            m = bot.send_message(message.chat.id, "Введите новый текст ТОПа:", reply_markup=get_cancel_kb())
+            bot.register_next_step_handler(m, step_admin_edit_top)
+            return
+
+    # --- КНОПКИ ИГРОКА ---
+    if message.text == "Свободный агент 🆓":
+        # КД 12 часов для обычных, 0 для админов
+        on_cd, wait = check_cooldown(message.from_user.id, uname, "fa_status", 43200)
+        if on_cd:
+            bot.send_message(message.chat.id, f"⚠️ Подождите еще {wait // 3600} ч.")
+            return
+        
+        nick = u_info.get("rb_nick", "Игрок")
+        tag = f"@{uname}" if uname else "Юзер скрыт"
+        try:
+            bot.send_message(CHANNEL_ID, f"🆓 **СВОБОДНЫЙ АГЕНТ**\n👤 Игрок: {nick}\n🔗 Связь: {tag}\n⚽️ Готов к предложениям!")
+            set_cooldown(message.from_user.id, "fa_status")
+            bot.send_message(message.chat.id, "✅ Статус отправлен в канал!")
+        except:
+            bot.send_message(message.chat.id, "❌ Ошибка публикации.")
+
+    elif message.text == "Свой текст 📝":
+        m = bot.send_message(message.chat.id, "💬 Введите текст для канала (Без КД для админов):", reply_markup=get_cancel_kb())
+        bot.register_next_step_handler(m, step_custom_announcement)
+
+    elif message.text == "Предложить трансфер 🤝":
+        owner_club = CLUB_OWNERS_LIST.get(uname) or u_info.get("owned_club") or (is_admin and "Администрация")
+        if owner_club:
+            m = bot.send_message(message.chat.id, "🎯 Введите @username игрока:", reply_markup=get_cancel_kb())
+            bot.register_next_step_handler(m, step_send_contract, owner_club)
+
+    elif message.text == "Профиль 👤":
+        st = "Пенсия ❌" if u_info.get("is_retired") else "Актив ✅"
+        cl = CLUB_OWNERS_LIST.get(uname) or u_info.get("owned_club") or "Нет"
+        bot.send_message(message.chat.id, f"👤 **ПРОФИЛЬ**\n🎮 Roblox: {u_info.get('rb_nick')}\n📊 Статус: {st}\n🏢 Клуб: {cl}")
+
+    elif message.text == "Список клубов 📋":
+        bot.send_message(message.chat.id, db["config"].get("clubs_list_text", "Пусто"))
+
+    elif message.text == "Топ клубов 🏆":
+        bot.send_message(message.chat.id, db["config"].get("top_clubs_text", "Пусто"))
+
+    elif message.text == "Написать админам 📩":
+        m = bot.send_message(message.chat.id, "✍️ Опишите проблему:", reply_markup=get_cancel_kb())
+        bot.register_next_step_handler(m, step_send_report)
+
+    elif message.text == "Завершение карьеры 🚫":
+        db["users"][uid]["is_retired"] = True
+        save_db(db)
+        bot.send_message(message.chat.id, "🚫 Карьера завершена. Вы больше не в поиске клубов.", reply_markup=get_main_kb(message.from_user.id, uname))
+
+    elif message.text == "Возвращение карьеры 🔙":
+        db["users"][uid]["is_retired"] = False
+        save_db(db)
+        bot.send_message(message.chat.id, "✅ Вы вернулись в строй!", reply_markup=get_main_kb(message.from_user.id, uname))
+
+    elif message.text == "Изменить ник ✏️":
+        m = bot.send_message(message.chat.id, "✏️ Введите новый ник:", reply_markup=get_cancel_kb())
+        bot.register_next_step_handler(m, step_change_nickname)
+
+# =================================================================
+# ОБРАБОТКА ТРАНСФЕРОВ
+# =================================================================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("tr_"))
+def tr_callback_handler(call):
+    db = load_db()
+    action = call.data.split("_")[1] # yes/no
+    sender_id = str(call.data.split("_")[2])
+    player_id = str(call.from_user.id)
+    
+    player_nick = db["users"].get(player_id, {}).get("rb_nick", "Игрок")
+    sender_uname = db["users"].get(sender_id, {}).get("username", "").lower()
+    club = CLUB_OWNERS_LIST.get(sender_uname) or db["users"].get(sender_id, {}).get("owned_club", "Клуб")
+
+    if action == "yes":
+        bot.edit_message_text(f"✅ Вы приняли контракт от {club}!", call.message.chat.id, call.message.message_id)
+        bot.send_message(sender_id, f"🔥 {player_nick} ПРИНЯЛ контракт!")
+        bot.send_message(CHANNEL_ID, f"🏠 **ТРАНСФЕР СОСТОЯЛСЯ**\n🎮 Игрок: {player_nick}\n🏢 Клуб: {club}")
+    else:
+        bot.edit_message_text("❌ Вы отклонили предложение.", call.message.chat.id, call.message.message_id)
+        bot.send_message(sender_id, f"❌ {player_nick} отклонил запрос.")
+
+# =================================================================
+# ЗАПУСК
+# =================================================================
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_execution_loop())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен вручную.")
-    except Exception as fatal_error:
-        logger.critical(f"ФАТАЛЬНАЯ ОШИБКА: {fatal_error}")
+    print("Бот Nazikrrk успешно запущен и готов к работе...")
+    bot.infinity_polling()
